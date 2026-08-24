@@ -20,6 +20,11 @@ MCP Server + Ghidra Plugin
 - Decompile and analyze binaries in Ghidra
 - Automatically rename methods and data
 - List methods, classes, imports, and exports
+- Bulk-read memory and pointer tables for whole-image analysis
+- Search symbols and inspect or edit data types
+- Define functions and disassemble undefined addresses
+- Rename and comment in batches
+- Run Ghidra scripts against the open program
 
 # Installation
 
@@ -38,6 +43,7 @@ First, download the latest [release](https://github.com/LaurieWired/GhidraMCP/re
 5. Restart Ghidra
 6. Make sure the GhidraMCPPlugin is enabled in `File` -> `Configure` -> `Developer`
 7. *Optional*: Configure the port in Ghidra with `Edit` -> `Tool Options` -> `GhidraMCP HTTP Server`
+8. *Optional*: The same options page has `Enable run_script`, which controls whether the server will run Ghidra scripts against the open program. It is on by default. The server listens on loopback only.
 
 Video Installation Guide:
 
@@ -73,7 +79,7 @@ Alternatively, edit this file directly:
 /Users/YOUR_USER/Library/Application Support/Claude/claude_desktop_config.json
 ```
 
-The server IP and port are configurable and should be set to point to the target Ghidra instance. If not set, both will default to localhost:8080.
+The server IP and port are configurable and should be set to point to the target Ghidra instance. If not set, both will default to localhost:8080. `--timeout` sets how long to wait for Ghidra to answer, defaulting to 60 seconds.
 
 ## Example 2: Cline
 To use GhidraMCP with [Cline](https://cline.bot), this requires manually running the MCP server as well. First run the following command:
