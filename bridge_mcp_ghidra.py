@@ -111,6 +111,63 @@ def safe_post_json_body(endpoint: str, payload) -> dict:
     except Exception as e:
         return {"error": f"Request failed: {str(e)}"}
 
+# ----------------------------------------------------------------------------------------------
+# Project and program selection
+# ----------------------------------------------------------------------------------------------
+
+@mcp.tool()
+def list_project_items(recursive: bool = True) -> dict:
+    """
+    List files and folders in the currently open Ghidra project.
+
+    Program files are marked with ``program: true`` and include their project path.  The path is
+    the value to pass to open_project_program.  The response also says whether each item is open
+    and whether it is the active program.  This lets an agent discover an imported/analyzed
+    executable without requiring the user to open it manually.
+
+    Args:
+        recursive: Include items below subfolders (default: true).
+    """
+    return safe_get_json("project_items", {"recursive": str(recursive).lower()})
+
+@mcp.tool()
+def list_open_programs() -> dict:
+    """
+    List all programs currently open in Ghidra.
+
+    Ghidra can keep multiple programs open, but only one is active at a time.  Existing analysis
+    tools operate on the active program; use select_program to switch between entries.
+    """
+    return safe_get_json("open_programs")
+
+@mcp.tool()
+def open_project_program(path: str) -> dict:
+    """
+    Open an analyzed program from the current Ghidra project and make it active.
+
+    ``path`` should normally be copied from the ``path`` field returned by list_project_items, for
+    example ``/MassEffect1.exe`` or ``/games/MassEffect2.exe``.  A unique project-file name is also
+    accepted.  If the program is already open, this only selects it and does not open a duplicate.
+    After this call, all existing listing, decompilation, search and mutation tools target this
+    program until another program is opened or selected.
+    """
+    if not path or not path.strip():
+        return {"error": "path is required; call list_project_items first"}
+    return safe_post_json("open_program", {"path": path})
+
+@mcp.tool()
+def select_program(path: str) -> dict:
+    """
+    Make an already-open Ghidra program the active program.
+
+    Use the project ``path`` from list_open_programs or list_project_items.  This does not reopen
+    or duplicate a program; if it is not open, call open_project_program instead.  All existing
+    analysis tools operate on the selected program.
+    """
+    if not path or not path.strip():
+        return {"error": "path is required; call list_open_programs first"}
+    return safe_post_json("select_program", {"path": path})
+
 @mcp.tool()
 def list_methods(offset: int = 0, limit: int = 100) -> list:
     """

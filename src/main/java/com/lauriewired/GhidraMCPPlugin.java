@@ -64,6 +64,9 @@ import ghidra.app.script.GhidraScriptUtil;
 import ghidra.app.script.GhidraState;
 import ghidra.app.util.cparser.C.CParser;
 import ghidra.framework.options.Options;
+import ghidra.framework.model.DomainFile;
+import ghidra.framework.model.DomainFolder;
+import ghidra.framework.model.ProjectData;
 import generic.jar.ResourceFile;
 
 import com.sun.net.httpserver.HttpExchange;
@@ -174,6 +177,30 @@ public class GhidraMCPPlugin extends Plugin {
         // Bind to loopback only. Everything this server exposes -- and /run_script in particular --
         // is meant for a coding agent running on this machine, never for the network.
         server = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), port), 0);
+
+        // Project/program management endpoints.  Ghidra supports multiple programs in one tool,
+        // but only one active program at a time.  The existing analysis endpoints intentionally
+        // continue to use the active program; these endpoints let an MCP client discover, open and
+        // select that program without requiring manual interaction with the Project window.
+        server.createContext("/project_items", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            boolean recursive = parseBooleanOrDefault(qparams.get("recursive"), true);
+            sendJsonResponse(exchange, listProjectItems(recursive));
+        });
+
+        server.createContext("/open_program", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            sendJsonResponse(exchange, openProjectProgram(params.get("path")));
+        });
+
+        server.createContext("/select_program", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            sendJsonResponse(exchange, selectOpenProgram(params.get("path")));
+        });
+
+        server.createContext("/open_programs", exchange -> {
+            sendJsonResponse(exchange, listOpenPrograms());
+        });
 
         // Each listing endpoint uses offset & limit from query params:
         server.createContext("/methods", exchange -> {
@@ -498,6 +525,266 @@ public class GhidraMCPPlugin extends Plugin {
     // ----------------------------------------------------------------------------------
     // Pagination-aware listing methods
     // ----------------------------------------------------------------------------------
+
+    /** Return all files and folders in the active Ghidra project as a JSON document. */
+    private JsonResult listProjectItems(boolean recursive) {
+        if (tool.getProject() == null) {
+            return JsonResult.badRequest("No Ghidra project is open");
+        }
+
+        ProjectData projectData = tool.getProject().getProjectData();
+        if (projectData == null || projectData.getRootFolder() == null) {
+            return JsonResult.badRequest("The active Ghidra project has no project data");
+        }
+
+        List<String> rendered = new ArrayList<>();
+        collectProjectItems(projectData.getRootFolder(), recursive, rendered,
+            new HashSet<String>());
+        Collections.sort(rendered);
+        return JsonResult.ok(new Json.Obj()
+            .raw("items", Json.array(rendered))
+            .num("count", rendered.size())
+            .done());
+    }
+
+    private void collectProjectItems(DomainFolder folder, boolean recursive,
+                                     List<String> rendered, Set<String> visitedFolders) {
+        String folderPath = folder.getPathname();
+        if (!visitedFolders.add(folderPath)) return;
+
+        for (DomainFile file : folder.getFiles()) {
+            rendered.add(renderProjectFile(file));
+        }
+        if (!recursive) return;
+
+        for (DomainFolder child : folder.getFolders()) {
+            rendered.add(renderProjectFolder(child));
+            collectProjectItems(child, true, rendered, visitedFolders);
+        }
+    }
+
+    private String renderProjectFolder(DomainFolder folder) {
+        return new Json.Obj()
+            .str("kind", "folder")
+            .str("name", folder.getName())
+            .str("path", folder.getPathname())
+            .done();
+    }
+
+    private String renderProjectFile(DomainFile file) {
+        Class<?> domainClass = file.getDomainObjectClass();
+        boolean isProgram = domainClass != null && Program.class.isAssignableFrom(domainClass);
+        Program current = getCurrentProgram();
+        boolean currentProgram = current != null && sameProgramPath(current, file.getPathname());
+
+        return new Json.Obj()
+            .str("kind", "file")
+            .str("name", file.getName())
+            .str("path", file.getPathname())
+            .str("content_type", file.getContentType())
+            .str("domain_class", domainClass != null ? domainClass.getName() : null)
+            .bool("program", isProgram)
+            .bool("open", file.isOpen())
+            .bool("current", currentProgram)
+            .done();
+    }
+
+    /** Open a program by its project path and make it the active program. */
+    private JsonResult openProjectProgram(String requestedPath) {
+        if (requestedPath == null || requestedPath.trim().isEmpty()) {
+            return JsonResult.badRequest("path is required; call list_project_items first");
+        }
+        if (tool.getProject() == null) {
+            return JsonResult.badRequest("No Ghidra project is open");
+        }
+
+        DomainFile file = findProjectFile(requestedPath);
+        if (file == null) {
+            return JsonResult.badRequest("No project item matched '" + requestedPath + "'");
+        }
+        Class<?> domainClass = file.getDomainObjectClass();
+        if (domainClass == null || !Program.class.isAssignableFrom(domainClass)) {
+            return JsonResult.badRequest("Project item '" + file.getPathname()
+                + "' is not a program (content type: " + file.getContentType() + ")");
+        }
+
+        AtomicReference<JsonResult> result = new AtomicReference<>();
+        try {
+            Runnable open = () -> {
+                ProgramManager pm = tool.getService(ProgramManager.class);
+                if (pm == null) {
+                    result.set(JsonResult.serverError("Ghidra's ProgramManager service is unavailable"));
+                    return;
+                }
+
+                Program program = findOpenProgram(pm, file.getPathname());
+                if (program == null) {
+                    program = pm.openProgram(file);
+                }
+                if (program == null) {
+                    result.set(JsonResult.serverError("Ghidra could not open '"
+                        + file.getPathname() + "'"));
+                    return;
+                }
+
+                pm.setCurrentProgram(program);
+                result.set(JsonResult.ok(programSummary(program, pm, "opened")));
+            };
+            if (SwingUtilities.isEventDispatchThread()) {
+                open.run();
+            }
+            else {
+                SwingUtilities.invokeAndWait(open);
+            }
+        }
+        catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return JsonResult.serverError("Interrupted while opening '" + file.getPathname() + "'");
+        }
+        catch (InvocationTargetException e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            Msg.error(this, "Failed to open project program", cause);
+            return JsonResult.serverError("Failed to open '" + file.getPathname()
+                + "': " + cause.getMessage());
+        }
+        return result.get() != null
+            ? result.get()
+            : JsonResult.serverError("Ghidra did not return an open-program result");
+    }
+
+    /** Make an already-open program active without opening a second copy. */
+    private JsonResult selectOpenProgram(String requestedPath) {
+        if (requestedPath == null || requestedPath.trim().isEmpty()) {
+            return JsonResult.badRequest("path is required; call list_open_programs first");
+        }
+
+        ProgramManager pm = tool.getService(ProgramManager.class);
+        if (pm == null) return JsonResult.serverError("Ghidra's ProgramManager service is unavailable");
+
+        AtomicReference<JsonResult> result = new AtomicReference<>();
+        Runnable select = () -> {
+            Program program = findOpenProgram(pm, requestedPath);
+            if (program == null) {
+                result.set(JsonResult.badRequest("No open program matched '" + requestedPath
+                    + "'; call open_project_program first"));
+                return;
+            }
+            pm.setCurrentProgram(program);
+            result.set(JsonResult.ok(programSummary(program, pm, "selected")));
+        };
+        try {
+            if (SwingUtilities.isEventDispatchThread()) {
+                select.run();
+            }
+            else {
+                SwingUtilities.invokeAndWait(select);
+            }
+        }
+        catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return JsonResult.serverError("Interrupted while selecting '" + requestedPath + "'");
+        }
+        catch (InvocationTargetException e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            Msg.error(this, "Failed to select open program", cause);
+            return JsonResult.serverError("Failed to select '" + requestedPath
+                + "': " + cause.getMessage());
+        }
+        return result.get() != null
+            ? result.get()
+            : JsonResult.serverError("Ghidra did not return a selected-program result");
+    }
+
+    /** List every program open in this Ghidra tool, including which one is active. */
+    private JsonResult listOpenPrograms() {
+        ProgramManager pm = tool.getService(ProgramManager.class);
+        if (pm == null) return JsonResult.serverError("Ghidra's ProgramManager service is unavailable");
+
+        List<String> programs = new ArrayList<>();
+        for (Program program : pm.getAllOpenPrograms()) {
+            programs.add(programSummary(program, pm, null));
+        }
+        programs.sort(Comparator.comparing(value -> value.toLowerCase(Locale.ROOT)));
+        return JsonResult.ok(new Json.Obj()
+            .raw("programs", Json.array(programs))
+            .num("count", programs.size())
+            .done());
+    }
+
+    private String programSummary(Program program, ProgramManager pm, String action) {
+        DomainFile file = program.getDomainFile();
+        String path = file != null ? file.getPathname() : null;
+        Json.Obj object = new Json.Obj()
+            .str("name", program.getName())
+            .str("path", path)
+            .str("executable_path", program.getExecutablePath())
+            .bool("current", pm.getCurrentProgram() == program)
+            .bool("visible", pm.isVisible(program));
+        if (action != null) object.str("action", action);
+        return object.done();
+    }
+
+    private DomainFile findProjectFile(String requestedPath) {
+        ProjectData projectData = tool.getProject().getProjectData();
+        String requested = normalizeProjectPath(requestedPath);
+        DomainFile exact = projectData.getFile(requested);
+        if (exact != null) return exact;
+
+        List<DomainFile> matches = new ArrayList<>();
+        collectProjectFiles(projectData.getRootFolder(), matches, new HashSet<String>());
+        String requestedName = projectItemName(requestedPath);
+        for (DomainFile file : matches) {
+            if (file.getPathname().equalsIgnoreCase(requested)
+                || file.getName().equalsIgnoreCase(requestedName)) {
+                return file;
+            }
+        }
+        return null;
+    }
+
+    private void collectProjectFiles(DomainFolder folder, List<DomainFile> files,
+                                     Set<String> visitedFolders) {
+        if (!visitedFolders.add(folder.getPathname())) return;
+        Collections.addAll(files, folder.getFiles());
+        for (DomainFolder child : folder.getFolders()) {
+            collectProjectFiles(child, files, visitedFolders);
+        }
+    }
+
+    private Program findOpenProgram(ProgramManager pm, String requestedPath) {
+        String requested = normalizeProjectPath(requestedPath);
+        String requestedName = projectItemName(requestedPath);
+        for (Program program : pm.getAllOpenPrograms()) {
+            DomainFile file = program.getDomainFile();
+            String executablePath = program.getExecutablePath();
+            if ((file != null && (file.getPathname().equalsIgnoreCase(requested)
+                || file.getName().equalsIgnoreCase(requestedName)))
+                || (executablePath != null && executablePath.equalsIgnoreCase(requestedPath.trim()))) {
+                return program;
+            }
+        }
+        return null;
+    }
+
+    private String projectItemName(String path) {
+        String normalized = path.trim().replace('\\', '/');
+        int separator = normalized.lastIndexOf('/');
+        return separator >= 0 ? normalized.substring(separator + 1) : normalized;
+    }
+
+    private boolean sameProgramPath(Program program, String path) {
+        DomainFile file = program.getDomainFile();
+        return file != null && file.getPathname().equalsIgnoreCase(path);
+    }
+
+    private String normalizeProjectPath(String path) {
+        String normalized = path.trim().replace('\\', '/');
+        if (!normalized.startsWith("/")) normalized = "/" + normalized;
+        while (normalized.length() > 1 && normalized.endsWith("/")) {
+            normalized = normalized.substring(0, normalized.length() - 1);
+        }
+        return normalized;
+    }
 
     private String getAllFunctionNames(int offset, int limit) {
         Program program = getCurrentProgram();
@@ -3341,6 +3628,14 @@ public class GhidraMCPPlugin extends Plugin {
         catch (NumberFormatException e) {
             return defaultValue;
         }
+    }
+
+    /** Parse a boolean query parameter, or return the supplied default for omitted/invalid input. */
+    private boolean parseBooleanOrDefault(String val, boolean defaultValue) {
+        if (val == null) return defaultValue;
+        if ("true".equalsIgnoreCase(val) || "1".equals(val)) return true;
+        if ("false".equalsIgnoreCase(val) || "0".equals(val)) return false;
+        return defaultValue;
     }
 
     /**

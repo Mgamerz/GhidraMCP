@@ -25,6 +25,33 @@ MCP Server + Ghidra Plugin
 - Define functions and disassemble undefined addresses
 - Rename and comment in batches
 - Run Ghidra scripts against the open program
+- Discover project files, open analyzed programs, and switch between multiple programs
+
+### Multiple analyzed programs
+
+Ghidra can have multiple programs open in one CodeBrowser tool, although only one is active at a
+time. The bridge exposes four project/program tools for agents:
+
+- `list_project_items` lists the current project's files and folders. Program files are marked with
+  `program: true` and provide the project path needed by the open tool.
+- `list_open_programs` shows every program already open and identifies the active one.
+- `open_project_program` opens an analyzed project program if needed and makes it active. If it is
+  already open, it is simply selected.
+- `select_program` switches to a program that is already open without opening another copy.
+
+All existing analysis tools operate on the active program. A typical agent flow is:
+
+```text
+list_project_items()
+open_project_program("/MassEffect1.exe")
+list_methods()
+open_project_program("/MassEffect2.exe")
+list_methods()
+select_program("/MassEffect1.exe")
+```
+
+The exact project paths should be taken from `list_project_items`; folders are supported, so a path
+may also look like `/Executables/MassEffect2.exe`.
 
 # Installation
 
